@@ -1,5 +1,8 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
+import 'package:reveal_duel/src/game/game_ai.dart';
 import 'package:reveal_duel/src/game/models.dart';
 import 'package:reveal_duel/src/util/uuid.dart';
 import 'package:shadcn_ui/shadcn_ui.dart' as shadcn;
@@ -11,23 +14,49 @@ extension on Player {
 class GameNotifier extends ChangeNotifier {
   GameNotifier()
     : _game = Game.fresh(
-        Player(name: "Goey", id: uuid.v4()),
-        Player(name: "Kol", id: uuid.v4()),
+        Player(name: "Player 1", id: uuid.v4()),
+        Player(name: "Player 2", id: uuid.v4()),
         GameOptions.skipBo(100),
-      );
+      ) {
+    ai = GameAi(
+      player: _game.opponent.player,
+      initialFlipStrategy: randomFlipStrategy(),
+      discardStrategy: replaceBlankDiscardStrategy(2, 1),
+      swapOrFlipStrategy: swapOrFlipValueStrategy(2),
+    );
+
+    Timer.periodic(Duration(seconds: 1), (_) {
+      _tick();
+    });
+  }
+
+  void _tick() {
+    if (!aiEnabled) return;
+
+    updateGame((game) => ai.determineMove(game));
+  }
+
   Game _game;
+  late GameAi ai;
+  bool aiEnabled = false;
   Game get game => _game;
+  late final Timer timer;
 
   void updateGame(Game Function(Game) gameAction) {
     _game = gameAction(_game);
     notifyListeners();
   }
 
+  void toggleAi() {
+    aiEnabled = !aiEnabled;
+    notifyListeners();
+  }
+
   void reset() {
     _game = Game.fresh(
-      Player(name: "Goey", id: uuid.v4()),
-      Player(name: "Kol", id: uuid.v4()),
-      GameOptions.skipBo(100),
+      _game.ownPlayer.player,
+      _game.opponent.player,
+      _game.options,
     );
     notifyListeners();
   }
@@ -64,6 +93,11 @@ class ControlButtons extends HookWidget {
       gameNotifier,
       () => gameNotifier.game.state,
     );
+
+    var aiEnabled = useListenableSelector(
+      gameNotifier,
+      () => gameNotifier.aiEnabled,
+    );
     return Padding(
       padding: EdgeInsetsGeometry.all(16),
       child: Row(
@@ -74,6 +108,14 @@ class ControlButtons extends HookWidget {
             child: Text("Next round"),
             onPressed: () {
               gameNotifier.updateGame((game) => game.startNextRound());
+            },
+          ),
+          shadcn.ShadButton(
+            backgroundColor: aiEnabled ? Colors.green : Colors.red,
+            enabled: [GameState.running, GameState.setup].contains(gameState),
+            child: Text("AI"),
+            onPressed: () {
+              gameNotifier.toggleAi();
             },
           ),
           shadcn.ShadButton(
@@ -158,10 +200,10 @@ class Board extends HookWidget {
       children: [
         Expanded(
           child: PlayerBoardDisplay(
-            playerBoard: ownBoard,
-            isActive: ownTurn,
+            isActive: opponentTurn,
+            playerBoard: opponentBoard,
             onTapCard: (card) {
-              var player = gameNotifier.game.ownPlayer.player;
+              var player = gameNotifier.game.opponent.player;
               handleAction(context, player, card);
             },
           ),
@@ -169,10 +211,10 @@ class Board extends HookWidget {
         SizedBox(height: 140, child: CardPiles()),
         Expanded(
           child: PlayerBoardDisplay(
-            isActive: opponentTurn,
-            playerBoard: opponentBoard,
+            playerBoard: ownBoard,
+            isActive: ownTurn,
             onTapCard: (card) {
-              var player = gameNotifier.game.opponent.player;
+              var player = gameNotifier.game.ownPlayer.player;
               handleAction(context, player, card);
             },
           ),
@@ -438,8 +480,9 @@ class ScoreCard extends StatelessWidget {
               true => theme.textTheme.h2,
             },
           ),
-          if (outOf != null)
+          if (outOf != null) ...[
             shadcn.ShadProgress(value: (value / outOf!).clamp(0, 1.0)),
+          ],
         ],
       ),
     );

@@ -88,6 +88,14 @@ class PlayerBoard {
       columns: columns.map((column) => column.flipAllCards()).toList(),
     );
   }
+
+  List<GameCard> getAllRevealedCards() {
+    return columns.fold([], (result, column) => [...result, ...column.cards.where((card) => card.revealed)]);
+  }
+
+  List<GameCard> getAllHiddenCards() {
+    return columns.fold([], (result, column) => [...result, ...column.cards.where((card) => !card.revealed)]);
+  }
 }
 
 class PlayerBoardColumn {
