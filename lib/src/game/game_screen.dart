@@ -70,15 +70,20 @@ class GameScreen extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return SafeArea(
-      child: Column(
-        children: [
-          GameHeader(),
-          SizedBox(height: 20),
-          Divider(),
-          SizedBox(height: 20),
-          Expanded(child: Board()),
-          SizedBox(height: 100, child: ControlButtons()),
-        ],
+      child: Center(
+        child: ConstrainedBox(
+          constraints: BoxConstraints.loose(Size(500, double.infinity)),
+          child: Column(
+            children: [
+              GameHeader(),
+              SizedBox(height: 20),
+              Divider(),
+              SizedBox(height: 20),
+              Expanded(child: Board()),
+              SizedBox(height: 100, child: ControlButtons()),
+            ],
+          ),
+        ),
       ),
     );
   }
@@ -113,7 +118,7 @@ class ControlButtons extends HookWidget {
           shadcn.ShadButton(
             backgroundColor: aiEnabled ? Colors.green : Colors.red,
             enabled: [GameState.running, GameState.setup].contains(gameState),
-            child: Text("AI"),
+            child: Text(aiEnabled ? "vs CPU" : "vs Player"),
             onPressed: () {
               gameNotifier.toggleAi();
             },
@@ -133,9 +138,16 @@ class ControlButtons extends HookWidget {
 class Board extends HookWidget {
   const Board({super.key});
 
-  void handleAction(BuildContext context, Player player, GameCard card) async {
+  Future<void> handleAction(
+    BuildContext context,
+    Player player,
+    GameCard card,
+  ) async {
     var game = gameNotifier.game;
     if (game.activePlayer == null) {
+      var playerCompletedSetup =
+          game.getPlayer(player).board.revealedCardCount == 2;
+      if (playerCompletedSetup) return;
       gameNotifier.updateGame((game) => game.flipInitialCard(player, card));
       return;
     }
@@ -147,19 +159,7 @@ class Board extends HookWidget {
       }
       var result = await showDialog(
         context: context,
-        builder: (context) => shadcn.ShadDialog(
-          closeIcon: null,
-          actions: [
-            shadcn.ShadButton(
-              child: Text("Replace"),
-              onPressed: () => Navigator.pop(context, true),
-            ),
-            shadcn.ShadButton(
-              child: Text("Flip"),
-              onPressed: () => Navigator.pop(context, false),
-            ),
-          ],
-        ),
+        builder: (context) => TradeOrFlipDialog(),
       );
       if (result == true) {
         gameNotifier.updateGame((game) => game.tradeVisibleCard(player, card));
@@ -168,6 +168,11 @@ class Board extends HookWidget {
         gameNotifier.updateGame((game) => game.flipCard(player, card));
       }
     } else {
+      var result = await showDialog(
+        context: context,
+        builder: (context) => TradeDiscardDialog(card: card),
+      );
+      if (result != true) return;
       gameNotifier.updateGame((game) => game.tradeDiscard(player, card));
     }
   }
@@ -196,31 +201,219 @@ class Board extends HookWidget {
           gameNotifier.game.activePlayer?.id ==
               gameNotifier.game.ownPlayer.player.id,
     );
+    var vsPlayer = useListenableSelector(
+      gameNotifier,
+      () => !gameNotifier.aiEnabled,
+    );
     return Column(
       children: [
         Expanded(
-          child: PlayerBoardDisplay(
-            isActive: opponentTurn,
-            playerBoard: opponentBoard,
-            onTapCard: (card) {
-              var player = gameNotifier.game.opponent.player;
-              handleAction(context, player, card);
-            },
+          child: AnimatedRotation(
+            duration: Duration(milliseconds: 500),
+            turns: vsPlayer ? 0.5 : 0,
+            child: PlayerBoardDisplay(
+              isActive: opponentTurn,
+              playerBoard: opponentBoard,
+              onTapCard: (card) async {
+                if (!opponentTurn) return;
+                var player = gameNotifier.game.opponent.player;
+                await handleAction(context, player, card);
+              },
+            ),
           ),
         ),
-        SizedBox(height: 140, child: CardPiles()),
+        SizedBox(height: 140, child: TurnPlayerRotator(child: CardPiles())),
         Expanded(
           child: PlayerBoardDisplay(
             playerBoard: ownBoard,
             isActive: ownTurn,
-            onTapCard: (card) {
+            onTapCard: (card) async {
+              if (!ownTurn) return;
               var player = gameNotifier.game.ownPlayer.player;
-              handleAction(context, player, card);
+              await handleAction(context, player, card);
             },
           ),
         ),
       ],
     );
+  }
+}
+
+class DrawCardDialog extends StatelessWidget {
+  const DrawCardDialog({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    var body = Padding(
+        padding: const EdgeInsets.symmetric(vertical: 16.0),
+        child: Row(
+          children: [
+            TappableGameCard(gameCard: gameNotifier.game.discard.last),
+            SizedBox(width: 16),
+            Expanded(
+              child: Text(
+                "You would not be able to use this card from the discard pile anymore",
+              ),
+            ),
+          ],
+        ),
+      );
+
+    var dialog = shadcn.ShadDialog(
+      closeIcon: null,
+      actionsMainAxisAlignment: MainAxisAlignment.center,
+      title: Text("Draw a card?"),
+      description: body,
+      actions: [
+        Expanded(
+          child: shadcn.ShadButton(
+            child: Text("Yes"),
+            onPressed: () => Navigator.pop(context, true),
+          ),
+        ),
+        Expanded(
+          child: shadcn.ShadButton(
+            child: Text("No"),
+            onPressed: () => Navigator.pop(context, false),
+          ),
+        ),
+      ],
+    );
+
+    return TurnPlayerRotator(child: dialog);
+  }
+}
+
+class TradeOrFlipDialog extends StatelessWidget {
+  const TradeOrFlipDialog({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    var body = Padding(
+      padding: const EdgeInsets.symmetric(vertical: 16.0),
+      child: Row(
+        spacing: 16,
+        children: [
+          Expanded(
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: () => Navigator.of(context).pop(true),
+                child: shadcn.ShadCard(
+                  child: Center(
+                    child: Column(
+                      spacing: 8,
+                      children: [
+                        TappableGameCard(
+                          gameCard: gameNotifier.game.visibleCard!,
+                        ),
+                        Icon(Icons.sync_alt_rounded, size: 40),
+                        Text("Replace"),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+          Expanded(
+            child: MouseRegion(
+              cursor: SystemMouseCursors.click,
+              child: GestureDetector(
+                onTap: () => Navigator.of(context).pop(false),
+                child: shadcn.ShadCard(
+                  child: Center(
+                    child: Column(
+                      spacing: 8,
+                      crossAxisAlignment: CrossAxisAlignment.center,
+                      children: [
+                        TappableGameCard(
+                          gameCard: GameCard(value: 0, revealed: false),
+                        ),
+                        Icon(Icons.remove_red_eye_rounded, size: 40),
+                        Text("Reveal"),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+    var dialog = shadcn.ShadDialog(
+      backgroundColor: shadcn.ShadTheme.of(
+        context,
+      ).colorScheme.background.withValues(alpha: 0.6),
+      closeIcon: null,
+      actionsMainAxisAlignment: MainAxisAlignment.center,
+      title: Text("Reveal or Replace?"),
+      description: body,
+    );
+    return TurnPlayerRotator(child: dialog);
+  }
+}
+
+class TradeDiscardDialog extends StatelessWidget {
+  const TradeDiscardDialog({required this.card, super.key});
+
+  final GameCard card;
+
+  @override
+  Widget build(BuildContext context) {
+    var body = Padding(
+      padding: const EdgeInsets.symmetric(vertical: 16.0),
+      child: Row(
+        children: [
+          Column(
+            children: [
+              Text("Discard"),
+              TappableGameCard(gameCard: gameNotifier.game.discard.last),
+            ],
+          ),
+          SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              children: [
+                Icon(Icons.sync_alt_rounded, size: 40),
+                Text("This will replace your card"),
+              ],
+            ),
+          ),
+          SizedBox(width: 16),
+          Column(
+            children: [
+              Text("Your card"),
+              TappableGameCard(gameCard: card),
+            ],
+          ),
+        ],
+      ),
+    );
+
+    var dialog = shadcn.ShadDialog(
+      closeIcon: null,
+      title: Text("Replace with Discard?"),
+      actionsMainAxisAlignment: MainAxisAlignment.center,
+      description: body,
+      actions: [
+        Expanded(
+          child: shadcn.ShadButton(
+            child: Text("Yes"),
+            onPressed: () => Navigator.pop(context, true),
+          ),
+        ),
+        Expanded(
+          child: shadcn.ShadButton(
+            child: Text("No"),
+            onPressed: () => Navigator.pop(context, false),
+          ),
+        ),
+      ],
+    );
+
+    return TurnPlayerRotator(child: dialog);
   }
 }
 
@@ -241,6 +434,8 @@ class CardPiles extends HookWidget {
       gameNotifier,
       () => gameNotifier.game.visibleCard,
     );
+    var canDrawCard =
+        visibleCard == null && gameNotifier.game.activePlayer != null;
     return Center(
       child: Row(
         mainAxisAlignment: MainAxisAlignment.spaceEvenly,
@@ -250,7 +445,10 @@ class CardPiles extends HookWidget {
             children: [
               Text("Discard"),
               SizedBox(height: 20),
-              TappableGameCard(gameCard: discard.last),
+              TappableGameCard(
+                gameCard: discard.last,
+                highLighted: canDrawCard,
+              ),
             ],
           ),
           Column(
@@ -260,9 +458,14 @@ class CardPiles extends HookWidget {
               SizedBox(height: 20),
               TappableGameCard(
                 gameCard: visibleCard ?? deck.last,
-                onTapCard: (card) {
-                  if (visibleCard == null &&
-                      gameNotifier.game.activePlayer != null) {
+                highLighted: visibleCard != null,
+                onTapCard: (card) async {
+                  if (!canDrawCard) return;
+                  var result = await showDialog(
+                    context: context,
+                    builder: (context) => DrawCardDialog(),
+                  );
+                  if (result == true) {
                     gameNotifier.updateGame(
                       (game) => game.drawCard(game.activePlayer!),
                     );
@@ -277,7 +480,7 @@ class CardPiles extends HookWidget {
   }
 }
 
-class PlayerBoardDisplay extends StatelessWidget {
+class PlayerBoardDisplay extends HookWidget {
   const PlayerBoardDisplay({
     required this.playerBoard,
     required this.onTapCard,
@@ -288,10 +491,21 @@ class PlayerBoardDisplay extends StatelessWidget {
   final PlayerBoard playerBoard;
   final bool isActive;
 
-  final void Function(GameCard card) onTapCard;
+  final Future<void> Function(GameCard card) onTapCard;
 
   @override
   Widget build(BuildContext context) {
+    var cardTapped = useState<String?>(null);
+
+    Future<void> onTapCard(GameCard card) async {
+      cardTapped.value = card.id;
+      try {
+        await this.onTapCard(card);
+      } finally {
+        cardTapped.value = null;
+      }
+    }
+
     return AnimatedOpacity(
       duration: Duration(milliseconds: 300),
       opacity: isActive ? 1.0 : 0.6,
@@ -307,6 +521,7 @@ class PlayerBoardDisplay extends StatelessWidget {
                         child: TappableGameCard(
                           gameCard: gameCard,
                           onTapCard: onTapCard,
+                          highLighted: cardTapped.value == gameCard.id,
                         ),
                       ),
                     ),
@@ -322,9 +537,15 @@ class PlayerBoardDisplay extends StatelessWidget {
 }
 
 class TappableGameCard extends StatelessWidget {
-  const TappableGameCard({required this.gameCard, this.onTapCard, super.key});
+  const TappableGameCard({
+    required this.gameCard,
+    this.onTapCard,
+    this.highLighted = false,
+    super.key,
+  });
 
   final GameCard gameCard;
+  final bool highLighted;
   final void Function(GameCard card)? onTapCard;
 
   Color getColorForValue() {
@@ -347,10 +568,13 @@ class TappableGameCard extends StatelessWidget {
       child: MouseRegion(
         cursor: SystemMouseCursors.click,
         child: GestureDetector(
-          onTap: () => onTapCard?.call(gameCard),
+          onTap: onTapCard == null ? null : () => onTapCard?.call(gameCard),
           child: shadcn.ShadCard(
             padding: EdgeInsets.zero,
             backgroundColor: getColorForValue(),
+            border: !highLighted
+                ? null
+                : Border.all(color: Colors.white, width: 2.5),
             child: Center(
               child: switch (gameCard.revealed) {
                 true => Center(
@@ -485,6 +709,27 @@ class ScoreCard extends StatelessWidget {
           ],
         ],
       ),
+    );
+  }
+}
+
+class TurnPlayerRotator extends HookWidget {
+  const TurnPlayerRotator({required this.child, super.key});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    var isOpponentPlayerTurn = useListenableSelector(
+      gameNotifier,
+      () =>
+          gameNotifier.game.activePlayer == gameNotifier.game.opponent.player &&
+          !gameNotifier.aiEnabled,
+    );
+    return AnimatedRotation(
+      turns: isOpponentPlayerTurn ? 0.5 : 0,
+      duration: Duration(milliseconds: 500),
+      child: child,
     );
   }
 }
