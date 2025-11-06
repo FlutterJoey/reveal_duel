@@ -1,5 +1,9 @@
 import 'dart:math';
 
+import 'package:flutter/foundation.dart';
+
+import 'package:reveal_duel/src/game/game_ai.dart';
+import 'package:reveal_duel/src/game/levels.dart';
 import 'package:reveal_duel/src/util/uuid.dart';
 
 class InvalidMoveException implements Exception {}
@@ -90,12 +94,34 @@ class PlayerBoard {
   }
 
   List<GameCard> getAllRevealedCards() {
-    return columns.fold([], (result, column) => [...result, ...column.cards.where((card) => card.revealed)]);
+    return columns.fold(
+      [],
+      (result, column) => [
+        ...result,
+        ...column.cards.where((card) => card.revealed),
+      ],
+    );
   }
 
   List<GameCard> getAllHiddenCards() {
-    return columns.fold([], (result, column) => [...result, ...column.cards.where((card) => !card.revealed)]);
+    return columns.fold(
+      [],
+      (result, column) => [
+        ...result,
+        ...column.cards.where((card) => !card.revealed),
+      ],
+    );
   }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+
+    return other is PlayerBoard && listEquals(other.columns, columns);
+  }
+
+  @override
+  int get hashCode => columns.hashCode;
 }
 
 class PlayerBoardColumn {
@@ -146,6 +172,16 @@ class PlayerBoardColumn {
       cards: cards.map((card) => card.revealCard()).toList(),
     );
   }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+
+    return other is PlayerBoardColumn && listEquals(other.cards, cards);
+  }
+
+  @override
+  int get hashCode => cards.hashCode;
 }
 
 class GameCard {
@@ -162,9 +198,22 @@ class GameCard {
   GameCard revealCard() {
     return GameCard._internal(id: id, value: value, revealed: true);
   }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+
+    return other is GameCard &&
+        other.value == value &&
+        other.id == id &&
+        other.revealed == revealed;
+  }
+
+  @override
+  int get hashCode => value.hashCode ^ id.hashCode ^ revealed.hashCode;
 }
 
-enum GameState { setup, running, finished }
+enum GameState { setup, running, roundFinished, finished }
 
 class Game {
   Game({
@@ -178,11 +227,12 @@ class Game {
     required this.round,
     required this.previousFinisher,
     required this.state,
+    Random? random,
     List<GameEvent>? events,
     String? id,
   }) : id = id ?? uuid.v4(),
        events = events ?? [] {
-    random = Random(uuid.hashCode);
+    this.random = random ?? Random(uuid.hashCode);
   }
 
   factory Game.fresh(Player ownPlayer, Player opponent, GameOptions options) {
@@ -198,6 +248,34 @@ class Game {
       round: 0,
       state: GameState.setup,
     ).startRound();
+  }
+
+  factory Game.fromLevel(GameLevel level, Player player) {
+    return Game(
+      deck: [],
+      discard: [],
+      activePlayer: null,
+      ownPlayer: GamePlayer(
+        player: player,
+        board: PlayerBoard.empty(),
+        points: level.playerPointStartAmount,
+        pointTarget: level.playerPointGoal,
+        startCards: level.playerCards,
+      ),
+      opponent: GamePlayer(
+        player: cpuPlayer,
+        board: PlayerBoard.empty(),
+        points: level.cpuPointStartAmount,
+        pointTarget: level.cpuPointGoal,
+        startCards: level.cpuCards,
+      ),
+      visibleCard: null,
+      options: GameOptions.skipBo(),
+      round: 0,
+      previousFinisher: null,
+      state: GameState.setup,
+      random: Random(level.seed),
+    );
   }
 
   final String id;
@@ -219,18 +297,30 @@ class Game {
   final GameOptions options;
 
   final List<GameEvent> events;
-  late final Random? random;
+  late final Random random;
 
   bool isFirstGame() => round == 1;
 
+  static const cardsPerBoard = 12;
+
   Game startRound() {
-    var deck = options.getCards()..shuffle();
-    var ownBoard = PlayerBoard.fromCards(
-      List.generate(12, (_) => deck.removeLast()),
-    );
-    var opponentBoard = PlayerBoard.fromCards(
-      List.generate(12, (_) => deck.removeLast()),
-    );
+    var deck = options.getCards()..shuffle(random);
+    var playerStartCards = deck.takeCardsOfValue(ownPlayer.startCards);
+    var cpuStartCards = deck.takeCardsOfValue(opponent.startCards);
+    var ownBoard = PlayerBoard.fromCards([
+      ...playerStartCards,
+      ...List.generate(
+        cardsPerBoard - playerStartCards.length,
+        (_) => deck.removeLast(),
+      ),
+    ]);
+    var opponentBoard = PlayerBoard.fromCards([
+      ...cpuStartCards,
+      ...List.generate(
+        cardsPerBoard - cpuStartCards.length,
+        (_) => deck.removeLast(),
+      ),
+    ]);
     return Game(
       deck: deck,
       discard: [deck.removeLast().revealCard()],
@@ -323,13 +413,19 @@ class Game {
       opponentScore *= 2;
     }
 
-    return allCardsFlipped.copyWith(
-      ownPlayer: allCardsFlipped.ownPlayer.updatePoints(allCardsFlipped.ownPlayer.points + ownPlayerScore),
-      opponent: allCardsFlipped.opponent.updatePoints(allCardsFlipped.opponent.points + opponentScore),
-      previousFinisher: (activePlayer,),
-      activePlayer: (null,),
-      state: GameState.finished,
-    );
+    return allCardsFlipped
+        .copyWith(
+          ownPlayer: allCardsFlipped.ownPlayer.updatePoints(
+            allCardsFlipped.ownPlayer.points + ownPlayerScore,
+          ),
+          opponent: allCardsFlipped.opponent.updatePoints(
+            allCardsFlipped.opponent.points + opponentScore,
+          ),
+          previousFinisher: (activePlayer,),
+          activePlayer: (null,),
+          state: GameState.roundFinished,
+        )
+        .checkGameEnd();
   }
 
   void checkState(GameState state) {
@@ -337,7 +433,7 @@ class Game {
   }
 
   Game startNextRound() {
-    checkState(GameState.finished);
+    checkState(GameState.roundFinished);
 
     return startRound();
   }
@@ -399,6 +495,22 @@ class Game {
     var updatedPlayer = gamePlayer.updateBoard((board) => board.flipCard(card));
 
     return updatePlayer(gamePlayer, updatedPlayer).checkSetupReady();
+  }
+
+  GamePlayer getWinner() {
+    if (opponent.points > ownPlayer.points) {
+      return ownPlayer;
+    }
+
+    return opponent;
+  }
+
+  Game checkGameEnd() {
+    if (state != GameState.roundFinished) return this;
+
+    if (!ownPlayer.reachedGoal() && !opponent.reachedGoal()) return this;
+
+    return copyWith(state: GameState.finished);
   }
 
   Game checkSetupReady() {
@@ -468,6 +580,43 @@ class Game {
       state: state ?? this.state,
     );
   }
+
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+
+    return other is Game &&
+        other.id == id &&
+        other.round == round &&
+        other.state == state &&
+        listEquals(other.deck, deck) &&
+        listEquals(other.discard, discard) &&
+        other.activePlayer == activePlayer &&
+        other.previousFinisher == previousFinisher &&
+        other.ownPlayer == ownPlayer &&
+        other.opponent == opponent &&
+        other.visibleCard == visibleCard &&
+        other.options == options &&
+        listEquals(other.events, events) &&
+        other.random == random;
+  }
+
+  @override
+  int get hashCode {
+    return id.hashCode ^
+        round.hashCode ^
+        state.hashCode ^
+        deck.hashCode ^
+        discard.hashCode ^
+        activePlayer.hashCode ^
+        previousFinisher.hashCode ^
+        ownPlayer.hashCode ^
+        opponent.hashCode ^
+        visibleCard.hashCode ^
+        options.hashCode ^
+        events.hashCode ^
+        random.hashCode;
+  }
 }
 
 class GameEvent {
@@ -496,21 +645,83 @@ enum EventType {
   clearColumn,
 }
 
+extension on List<GameCard> {
+  List<GameCard> takeCardsOfValue(List<int> cards) {
+    var cardsTaken = <GameCard>[];
+    if (cards.isEmpty) return cardsTaken;
+    for (var cardValue in cards.sublist(
+      0,
+      max(cards.length, Game.cardsPerBoard),
+    )) {
+      var card = where((card) => card.value == cardValue).firstOrNull;
+      if (card == null) continue;
+      remove(card);
+      cardsTaken.add(card);
+    }
+    return cardsTaken;
+  }
+}
+
 class GamePlayer {
   final Player player;
   final PlayerBoard board;
   final int points;
+  final int pointTarget;
+  final List<int> startCards;
 
-  GamePlayer({required this.player, required this.board, required this.points});
+  GamePlayer({
+    required this.player,
+    required this.board,
+    required this.points,
+    required this.pointTarget,
+    required this.startCards,
+  });
 
-  GamePlayer.fresh(this.player) : board = PlayerBoard.empty(), points = 0;
+  GamePlayer.fresh(this.player)
+    : board = PlayerBoard.empty(),
+      points = 0,
+      startCards = [],
+      pointTarget = 100;
 
-  GamePlayer updateBoard(PlayerBoard Function(PlayerBoard) update) {
-    return GamePlayer(player: player, board: update(board), points: points);
+  GamePlayer updateBoard(PlayerBoard Function(PlayerBoard) update) =>
+      copyWith(board: update(board));
+
+  GamePlayer updatePoints(int points) => copyWith(points: points);
+
+  GamePlayer copyWith({
+    Player? player,
+    PlayerBoard? board,
+    int? points,
+    int? pointTarget,
+    List<int>? startCards,
+  }) => GamePlayer(
+    player: player ?? this.player,
+    board: board ?? this.board,
+    points: points ?? this.points,
+    pointTarget: pointTarget ?? this.pointTarget,
+    startCards: startCards ?? this.startCards,
+  );
+
+  bool reachedGoal() => points >= pointTarget;
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+
+    return other is GamePlayer &&
+        other.player == player &&
+        other.board == board &&
+        other.points == points &&
+        other.pointTarget == pointTarget &&
+        listEquals(other.startCards, startCards);
   }
 
-  GamePlayer updatePoints(int points) {
-    return GamePlayer(player: player, board: board, points: points);
+  @override
+  int get hashCode {
+    return player.hashCode ^
+        board.hashCode ^
+        points.hashCode ^
+        pointTarget.hashCode ^
+        startCards.hashCode;
   }
 }
 
@@ -519,17 +730,24 @@ class Player {
   final String id;
 
   Player({required this.name, required this.id});
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+
+    return other is Player && other.name == name && other.id == id;
+  }
+
+  @override
+  int get hashCode => name.hashCode ^ id.hashCode;
 }
 
 class GameOptions {
-  final int goal;
   final Map<int, int> gameCardDistribution;
 
-  GameOptions({required this.goal, required this.gameCardDistribution});
+  GameOptions({required this.gameCardDistribution});
 
-  factory GameOptions.skipBo(int goal) {
+  factory GameOptions.skipBo() {
     return GameOptions(
-      goal: goal,
       gameCardDistribution: {
         ...{-2: 6, -1: 12, 0: 18},
         ...{1: 12, 2: 12, 3: 12, 4: 12},
@@ -543,4 +761,14 @@ class GameOptions {
     for (var MapEntry(key: card, value: amount) in gameCardDistribution.entries)
       ...List.generate(amount, (_) => GameCard(value: card)),
   ];
+  @override
+  bool operator ==(Object other) {
+    if (identical(this, other)) return true;
+
+    return other is GameOptions &&
+        mapEquals(other.gameCardDistribution, gameCardDistribution);
+  }
+
+  @override
+  int get hashCode => gameCardDistribution.hashCode;
 }

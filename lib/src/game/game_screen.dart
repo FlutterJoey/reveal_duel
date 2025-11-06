@@ -2,70 +2,57 @@ import 'dart:async';
 
 import 'package:flutter/material.dart';
 import 'package:flutter_hooks/flutter_hooks.dart';
-import 'package:reveal_duel/src/game/game_ai.dart';
+import 'package:reveal_duel/src/game/game_controller.dart';
+import 'package:reveal_duel/src/game/levels.dart';
 import 'package:reveal_duel/src/game/models.dart';
-import 'package:reveal_duel/src/util/uuid.dart';
 import 'package:shadcn_ui/shadcn_ui.dart' as shadcn;
+import 'package:shared_preferences/shared_preferences.dart';
 
 extension on Player {
   Color get color => Colors.primaries[id.hashCode % Colors.primaries.length];
 }
 
-class GameNotifier extends ChangeNotifier {
-  GameNotifier()
-    : _game = Game.fresh(
-        Player(name: "Player 1", id: uuid.v4()),
-        Player(name: "Player 2", id: uuid.v4()),
-        GameOptions.skipBo(100),
-      ) {
-    ai = GameAi(
-      player: _game.opponent.player,
-      initialFlipStrategy: randomFlipStrategy(),
-      discardStrategy: replaceBlankDiscardStrategy(2, 1),
-      swapOrFlipStrategy: swapOrFlipValueStrategy(2),
-    );
+class GameScreen extends HookWidget {
+  const GameScreen({required this.onExit, super.key});
 
-    Timer.periodic(Duration(seconds: 1), (_) {
-      _tick();
-    });
+  final void Function() onExit;
+
+  void exitGame() {
+    gameNotifier.reset();
+    onExit();
   }
 
-  void _tick() {
-    if (!aiEnabled) return;
+  @override
+  Widget build(BuildContext context) {
+    var hasGame = useListenableSelector(gameNotifier, () => true);
 
-    updateGame((game) => ai.determineMove(game));
-  }
+    if (!hasGame) {
+      return SafeArea(
+        child: Center(
+          child: Column(
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 20),
+              shadcn.ShadButton(
+                onPressed: () {
+                  exitGame();
+                },
+                child: Text("Return to home screen"),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
 
-  Game _game;
-  late GameAi ai;
-  bool aiEnabled = false;
-  Game get game => _game;
-  late final Timer timer;
-
-  void updateGame(Game Function(Game) gameAction) {
-    _game = gameAction(_game);
-    notifyListeners();
-  }
-
-  void toggleAi() {
-    aiEnabled = !aiEnabled;
-    notifyListeners();
-  }
-
-  void reset() {
-    _game = Game.fresh(
-      _game.ownPlayer.player,
-      _game.opponent.player,
-      _game.options,
-    );
-    notifyListeners();
+    return ActiveGameLayout(onExit: exitGame);
   }
 }
 
-final gameNotifier = GameNotifier();
+class ActiveGameLayout extends HookWidget {
+  const ActiveGameLayout({super.key, required this.onExit});
 
-class GameScreen extends StatelessWidget {
-  const GameScreen({super.key});
+  final void Function() onExit;
 
   @override
   Widget build(BuildContext context) {
@@ -75,12 +62,13 @@ class GameScreen extends StatelessWidget {
           constraints: BoxConstraints.loose(Size(500, double.infinity)),
           child: Column(
             children: [
+              GameStateDialogs(onExit: onExit),
               GameHeader(),
               SizedBox(height: 20),
               Divider(),
               SizedBox(height: 20),
               Expanded(child: Board()),
-              SizedBox(height: 100, child: ControlButtons()),
+              SizedBox(height: 100, child: LevelDisplay(onExitGame: onExit)),
             ],
           ),
         ),
@@ -89,45 +77,298 @@ class GameScreen extends StatelessWidget {
   }
 }
 
-class ControlButtons extends HookWidget {
-  const ControlButtons({super.key});
+class GameStateDialogs extends HookWidget {
+  const GameStateDialogs({required this.onExit, super.key});
+
+  final void Function() onExit;
 
   @override
   Widget build(BuildContext context) {
-    var gameState = useListenableSelector(
-      gameNotifier,
-      () => gameNotifier.game.state,
+    useEffect(() {
+      GameState? previousState;
+      Future<void> listen() async {
+        if (!gameNotifier.gameAvailable) {
+          previousState = null;
+          return;
+        }
+        var currentState = gameNotifier.game.state;
+        if (previousState == currentState) return;
+        previousState = currentState;
+
+        switch (currentState) {
+          // gamestates that are not relevant to show dialogs for
+          case GameState.running:
+          case GameState.setup:
+            break;
+          case GameState.roundFinished:
+            showDialog(
+              context: context,
+              builder: (context) {
+                return const EndOfRoundDialog();
+              },
+            );
+
+          case GameState.finished:
+            var result = await showDialog(
+              context: context,
+              builder: (context) {
+                return const EndOfGameDialog();
+              },
+            );
+
+            if (result == true) {
+              var level = GameLevel.getById(gameNotifier.currentLevel!);
+              var player = gameNotifier.game.ownPlayer.player;
+              gameNotifier.reset();
+              gameNotifier.setupLevel(level, player);
+            } else {
+              onExit();
+            }
+        }
+      }
+
+      gameNotifier.addListener(listen);
+
+      return () {
+        gameNotifier.removeListener(listen);
+      };
+    }, []);
+
+    return const SizedBox.shrink();
+  }
+}
+
+class EndOfRoundDialog extends StatelessWidget {
+  const EndOfRoundDialog({super.key});
+
+  Widget getPlayerStandings(GamePlayer player, TextStyle style) {
+    return Text(
+      "${player.player.name}: ${player.points} / ${player.pointTarget}",
+      style: style,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    var textTheme = shadcn.ShadTheme.of(context).textTheme;
+    var style = textTheme.list;
+    return shadcn.ShadDialog(
+      title: Text("Round finished"),
+      description: Text("Round ${gameNotifier.game.round} finished"),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              spacing: 16,
+              children: [
+                Text("Standings", style: textTheme.h3),
+                getPlayerStandings(gameNotifier.game.ownPlayer, style),
+                getPlayerStandings(gameNotifier.game.opponent, style),
+              ],
+            ),
+          ),
+          Expanded(
+            child: shadcn.ShadButton(
+              onPressed: () {
+                gameNotifier.updateGame((game) => game.startNextRound());
+                Navigator.of(context).pop();
+              },
+              child: Text("Start next round"),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class EndOfGameDialog extends StatelessWidget {
+  const EndOfGameDialog({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    var levelId = gameNotifier.currentLevel;
+    if (levelId != null) {
+      return EndOfLevelDialog(levelId: levelId);
+    }
+
+    var winner = gameNotifier.game.getWinner();
+    return shadcn.ShadDialog(
+      title: Text("Game Finished"),
+      actions: [
+        shadcn.ShadButton(
+          onPressed: () {
+            gameNotifier.updateGame((game) {
+              return Game.fresh(
+                game.ownPlayer.player,
+                game.opponent.player,
+                game.options,
+              );
+            });
+          },
+          child: Text("Reset"),
+        ),
+        shadcn.ShadButton(
+          onPressed: () {
+            Navigator.of(context).pop();
+          },
+          child: Text("Back to home"),
+        ),
+      ],
+      child: Text("${winner.player.name} wins!"),
+    );
+  }
+}
+
+class EndOfLevelDialog extends HookWidget {
+  const EndOfLevelDialog({super.key, required this.levelId});
+
+  final int levelId;
+
+  @override
+  Widget build(BuildContext context) {
+    var gamePlayer = gameNotifier.game.ownPlayer;
+    var completedLevel =
+        gameNotifier.game.getWinner().player.id == gamePlayer.player.id;
+    var statistics = useMemoized(
+      () => LevelStatistic(
+        bestPlayerScore: gamePlayer.pointTarget - gamePlayer.points,
+        bestTime: DateTime.now().difference(gameNotifier.start!).abs(),
+      ),
     );
 
-    var aiEnabled = useListenableSelector(
-      gameNotifier,
-      () => gameNotifier.aiEnabled,
+    if (!completedLevel) {
+      return shadcn.ShadDialog(
+        title: Text("Level failed!"),
+        description: Text(
+          "It seems this level got the better of you, better luck next time!",
+        ),
+        actions: [
+          shadcn.ShadButton(
+            child: Text("Retry"),
+            onPressed: () {
+              Navigator.of(context).pop(true);
+            },
+          ),
+          shadcn.ShadButton(
+            child: Text("Exit"),
+            onPressed: () {
+              Navigator.of(context).pop();
+            },
+          ),
+        ],
+      );
+    }
+
+    return shadcn.ShadDialog(
+      title: Text("Level $levelId complete!"),
+      description: Text("Congratulations on completing this level!"),
+      actions: [
+        shadcn.ShadButton(
+          child: Text("Exit"),
+          onPressed: () async {
+            var sharedPreferences = await SharedPreferences.getInstance();
+            playerProgressionController.savePlayerProgression(
+              levelIndex: levelId,
+              statistic: statistics,
+              hasWon: completedLevel,
+              preferences: sharedPreferences,
+            );
+            if (!context.mounted) return;
+            Navigator.of(context).pop();
+          },
+        ),
+      ],
     );
+  }
+}
+
+class LevelDisplay extends HookWidget {
+  const LevelDisplay({required this.onExitGame, super.key});
+
+  final void Function() onExitGame;
+
+  Future<void> openSettings(BuildContext context) async {
+    var parentContext = context;
+    await showDialog(
+      context: context,
+      builder: (context) {
+        return shadcn.ShadDialog(
+          title: Text("Menu"),
+          child: Padding(
+            padding: EdgeInsetsGeometry.all(32),
+            child: shadcn.ShadButton(
+              child: Text("Exit game"),
+              onPressed: () {
+                if (parentContext.mounted) {
+                  Navigator.of(context).pop();
+                  onExitGame();
+                }
+              },
+            ),
+          ),
+        );
+      },
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    var level = useListenableSelector(
+      gameNotifier,
+      () => gameNotifier.currentLevel,
+    );
+
+    var startTime = useListenableSelector(
+      gameNotifier,
+      () => gameNotifier.start,
+    );
+    var theme = shadcn.ShadTheme.of(context);
+
+    var text = switch (level) {
+      int level => "Level $level",
+      null => "Casual game",
+    };
+
     return Padding(
       padding: EdgeInsetsGeometry.all(16),
-      child: Row(
-        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+      child: Stack(
         children: [
-          shadcn.ShadButton(
-            enabled: gameState == GameState.finished,
-            child: Text("Next round"),
-            onPressed: () {
-              gameNotifier.updateGame((game) => game.startNextRound());
-            },
+          Positioned.fill(
+            child: Center(child: Text(text, style: theme.textTheme.h2)),
           ),
-          shadcn.ShadButton(
-            backgroundColor: aiEnabled ? Colors.green : Colors.red,
-            enabled: [GameState.running, GameState.setup].contains(gameState),
-            child: Text(aiEnabled ? "vs CPU" : "vs Player"),
-            onPressed: () {
-              gameNotifier.toggleAi();
-            },
-          ),
-          shadcn.ShadButton(
-            child: Text("Reset"),
-            onPressed: () {
-              gameNotifier.reset();
-            },
+          Positioned.fill(
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Visibility(
+                  visible: startTime != null,
+                  child: HookBuilder(
+                    builder: (context) {
+                      var currentTimeInSeconds = useState(0);
+                      useEffect(() {
+                        var timer = Timer.periodic(
+                          Duration(seconds: 1),
+                          (_) => currentTimeInSeconds.value = DateTime.now()
+                              .difference(startTime!)
+                              .abs()
+                              .inSeconds,
+                        );
+                        return timer.cancel;
+                      }, [startTime]);
+
+                      return Text("Time: ${currentTimeInSeconds.value}");
+                    },
+                  ),
+                ),
+                shadcn.ShadIconButton(
+                  icon: Icon(shadcn.LucideIcons.settings),
+                  onPressed: () => openSettings(context),
+                ),
+              ],
+            ),
           ),
         ],
       ),
@@ -203,7 +444,7 @@ class Board extends HookWidget {
     );
     var vsPlayer = useListenableSelector(
       gameNotifier,
-      () => !gameNotifier.aiEnabled,
+      () => !gameNotifier.cpuEnabled,
     );
     return Column(
       children: [
@@ -215,6 +456,7 @@ class Board extends HookWidget {
               isActive: opponentTurn,
               playerBoard: opponentBoard,
               onTapCard: (card) async {
+                if (!vsPlayer) return;
                 if (!opponentTurn) return;
                 var player = gameNotifier.game.opponent.player;
                 await handleAction(context, player, card);
@@ -245,37 +487,32 @@ class DrawCardDialog extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     var body = Padding(
-        padding: const EdgeInsets.symmetric(vertical: 16.0),
-        child: Row(
-          children: [
-            TappableGameCard(gameCard: gameNotifier.game.discard.last),
-            SizedBox(width: 16),
-            Expanded(
-              child: Text(
-                "You would not be able to use this card from the discard pile anymore",
-              ),
+      padding: const EdgeInsets.symmetric(vertical: 16.0),
+      child: Row(
+        children: [
+          TappableGameCard(gameCard: gameNotifier.game.discard.last),
+          SizedBox(width: 16),
+          Expanded(
+            child: Text(
+              "You would not be able to use this card from the discard pile anymore",
             ),
-          ],
-        ),
-      );
+          ),
+        ],
+      ),
+    );
 
     var dialog = shadcn.ShadDialog(
-      closeIcon: null,
       actionsMainAxisAlignment: MainAxisAlignment.center,
       title: Text("Draw a card?"),
       description: body,
       actions: [
-        Expanded(
-          child: shadcn.ShadButton(
-            child: Text("Yes"),
-            onPressed: () => Navigator.pop(context, true),
-          ),
+        shadcn.ShadButton(
+          child: Text("Yes"),
+          onPressed: () => Navigator.pop(context, true),
         ),
-        Expanded(
-          child: shadcn.ShadButton(
-            child: Text("No"),
-            onPressed: () => Navigator.pop(context, false),
-          ),
+        shadcn.ShadButton(
+          child: Text("No"),
+          onPressed: () => Navigator.pop(context, false),
         ),
       ],
     );
@@ -398,17 +635,13 @@ class TradeDiscardDialog extends StatelessWidget {
       actionsMainAxisAlignment: MainAxisAlignment.center,
       description: body,
       actions: [
-        Expanded(
-          child: shadcn.ShadButton(
-            child: Text("Yes"),
-            onPressed: () => Navigator.pop(context, true),
-          ),
+        shadcn.ShadButton(
+          child: Text("Yes"),
+          onPressed: () => Navigator.pop(context, true),
         ),
-        Expanded(
-          child: shadcn.ShadButton(
-            child: Text("No"),
-            onPressed: () => Navigator.pop(context, false),
-          ),
+        shadcn.ShadButton(
+          child: Text("No"),
+          onPressed: () => Navigator.pop(context, false),
         ),
       ],
     );
@@ -619,10 +852,6 @@ class GameHeader extends HookWidget {
       gameNotifier,
       () => gameNotifier.game.activePlayer,
     );
-    var points = useListenableSelector(
-      gameNotifier,
-      () => gameNotifier.game.options.goal,
-    );
     var round = useListenableSelector(
       gameNotifier,
       () => gameNotifier.game.round,
@@ -636,7 +865,7 @@ class GameHeader extends HookWidget {
             color: ownPlayer.player.color,
             isActive: ownPlayer.player.id == currentPlayer?.id,
             value: ownPlayer.points,
-            outOf: points,
+            outOf: ownPlayer.pointTarget,
           ),
         ),
         Spacer(),
@@ -649,7 +878,7 @@ class GameHeader extends HookWidget {
             color: opponent.player.color,
             isActive: opponent.player.id == currentPlayer?.id,
             value: opponent.points,
-            outOf: points,
+            outOf: opponent.pointTarget,
           ),
         ),
       ],
@@ -724,7 +953,7 @@ class TurnPlayerRotator extends HookWidget {
       gameNotifier,
       () =>
           gameNotifier.game.activePlayer == gameNotifier.game.opponent.player &&
-          !gameNotifier.aiEnabled,
+          !gameNotifier.cpuEnabled,
     );
     return AnimatedRotation(
       turns: isOpponentPlayerTurn ? 0.5 : 0,
